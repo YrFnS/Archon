@@ -694,13 +694,32 @@ async function collectCodexAuth(): Promise<CodexTokens | null> {
  * Collect AI assistant configuration
  */
 async function collectAIConfig(): Promise<SetupConfig['ai']> {
+  // Build multiselect options dynamically from registered providers
+  const providers = getRegisteredProviders();
+  const builtinProviders = providers.filter(p => p.builtIn);
+  const communityProviders = providers.filter(p => !p.builtIn);
+
+  const multiselectOptions = [
+    ...builtinProviders.map(p => ({
+      value: p.id,
+      label: p.id === 'claude' ? `${p.displayName} (Recommended)` : p.displayName,
+      hint:
+        p.id === 'claude'
+          ? 'Anthropic Claude Code SDK'
+          : p.id === 'codex'
+            ? 'OpenAI Codex SDK'
+            : undefined,
+    })),
+    ...communityProviders.map(p => ({
+      value: p.id,
+      label: p.displayName,
+      hint: 'community',
+    })),
+  ];
+
   const assistants = await multiselect({
-    message:
-      'Which built-in AI assistant(s) will you use? (↑↓ navigate, space select, enter confirm)',
-    options: [
-      { value: 'claude', label: 'Claude (Recommended)', hint: 'Anthropic Claude Code SDK' },
-      { value: 'codex', label: 'Codex', hint: 'OpenAI Codex SDK' },
-    ],
+    message: 'Which AI assistant(s) will you use? (↑↓ navigate, space select, enter confirm)',
+    options: multiselectOptions,
     required: false,
   });
 
@@ -709,8 +728,10 @@ async function collectAIConfig(): Promise<SetupConfig['ai']> {
     process.exit(0);
   }
 
-  let hasClaude = assistants.includes('claude');
-  let hasCodex = assistants.includes('codex');
+  // Parse selected providers
+  const selectedProviders = assistants;
+  const hasClaude = selectedProviders.includes('claude');
+  const hasCodex = selectedProviders.includes('codex');
 
   // Check if selected CLI tools are installed
   if (hasClaude && !isCommandAvailable('claude')) {
@@ -727,7 +748,6 @@ async function collectAIConfig(): Promise<SetupConfig['ai']> {
       cancel('Please install Claude Code and run setup again.');
       process.exit(0);
     }
-    hasClaude = false;
   }
 
   if (hasCodex && !isCommandAvailable('codex')) {
@@ -760,7 +780,6 @@ After installing Node.js, run 'archon setup' again.`,
           cancel('Please install Node.js 18+ and run setup again.');
           process.exit(0);
         }
-        hasCodex = false;
       } else if (nodeVersion.major < 18) {
         note(
           `Node.js ${nodeVersion.major}.${nodeVersion.minor}.${nodeVersion.patch} is installed, but Codex CLI requires Node.js 18 or later.
@@ -787,7 +806,6 @@ After upgrading, run 'archon setup' again.`,
           cancel('Please upgrade Node.js to 18+ and run setup again.');
           process.exit(0);
         }
-        hasCodex = false;
       }
     }
 
@@ -806,11 +824,20 @@ After upgrading, run 'archon setup' again.`,
         cancel('Please install Codex CLI and run setup again.');
         process.exit(0);
       }
-      hasCodex = false;
     }
   }
 
-  if (!hasClaude && !hasCodex) {
+  // Recalculate after user chose to skip
+  const finalHasClaude = hasClaude && isCommandAvailable('claude');
+  const finalHasCodex = hasCodex && isCommandAvailable('codex');
+
+  // Check if any provider selected (built-in or community)
+  const hasAnyBuiltIn = finalHasClaude || finalHasCodex;
+  const hasCommunityProvider = selectedProviders.some(
+    id => !getRegisteredProviders().find(p => p.id === id)?.builtIn
+  );
+
+  if (!hasAnyBuiltIn && !hasCommunityProvider) {
     log.warning('No AI assistant selected. You can add one later by running `archon setup` again.');
     return {
       claude: false,
@@ -825,8 +852,8 @@ After upgrading, run 'archon setup' again.`,
   let claudeBinaryPath: string | undefined;
   let codexTokens: CodexTokens | undefined;
 
-  // Collect Claude auth if selected
-  if (hasClaude) {
+  // Collect Claude auth if selected (built-in requires auth)
+  if (finalHasClaude) {
     const claudeAuth = await collectClaudeAuth();
     claudeAuthType = claudeAuth.authType;
     claudeApiKey = claudeAuth.apiKey;
@@ -834,23 +861,32 @@ After upgrading, run 'archon setup' again.`,
     claudeBinaryPath = await collectClaudeBinaryPath();
   }
 
-  // Collect Codex auth if selected
-  if (hasCodex) {
+  // Collect Codex auth if selected (built-in requires auth)
+  if (finalHasCodex) {
     const tokens = await collectCodexAuth();
     codexTokens = tokens ?? undefined;
   }
 
-  // Determine default assistant — use the registry, but keep setup/auth flows built-in only.
-  // Default to first registered built-in provider rather than hardcoding 'claude'.
-  let defaultAssistant = getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude';
+  // Community providers (e.g., Pi) manage their own auth externally — no collection needed here
 
-  if (hasClaude && hasCodex) {
-    const providerChoices = getRegisteredProviders()
-      .filter(p => p.builtIn)
-      .map(p => ({
-        value: p.id,
-        label: p.id === 'claude' ? `${p.displayName} (Recommended)` : p.displayName,
-      }));
+  // Determine default assistant
+  const builtinSelected = selectedProviders.filter(id =>
+    getRegisteredProviders().find(p => p.id === id && p.builtIn)
+  );
+
+  let defaultAssistant: string;
+  if (builtinSelected.length > 1) {
+    // Multiple built-in providers: prompt user to choose default
+    const providerChoices: { value: string; label: string }[] = [];
+    for (const id of builtinSelected) {
+      const p = getRegisteredProviders().find(p => p.id === id);
+      if (p) {
+        providerChoices.push({
+          value: p.id,
+          label: p.id === 'claude' ? `${p.displayName} (Recommended)` : p.displayName,
+        });
+      }
+    }
 
     const defaultChoice = await select({
       message: 'Which should be the default AI assistant?',
@@ -863,17 +899,24 @@ After upgrading, run 'archon setup' again.`,
     }
 
     defaultAssistant = defaultChoice;
-  } else if (hasCodex && !hasClaude) {
-    defaultAssistant = 'codex';
+  } else if (builtinSelected.length === 1) {
+    // Single built-in provider selected
+    defaultAssistant = builtinSelected[0];
+  } else if (selectedProviders.length > 0) {
+    // Only community providers selected — use first one
+    defaultAssistant = selectedProviders[0];
+  } else {
+    // Fallback to first available built-in
+    defaultAssistant = getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude';
   }
 
   return {
-    claude: hasClaude,
+    claude: finalHasClaude,
     claudeAuthType,
     claudeApiKey,
     claudeOauthToken,
     ...(claudeBinaryPath !== undefined ? { claudeBinaryPath } : {}),
-    codex: hasCodex,
+    codex: finalHasCodex,
     codexTokens,
     defaultAssistant,
   };
